@@ -1,7 +1,6 @@
 process.env.YTDL_NO_UPDATE = 'true';
 require('dotenv').config(); // 載入 .env 環境變數
 
-const express = require('express'); // 保持 Render 活著用
 const { Client, GatewayIntentBits } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
 const ytdl = require("@distube/ytdl-core");
@@ -106,10 +105,3 @@ function playNext(guildId) {
 
 // 登入 Discord
 client.login(process.env.DISCORD_TOKEN);
-
-// 建立 Express Web 服務，讓 Render 不會休眠
-const app = express();
-app.get('/', (req, res) => res.send('Bot is running!'));
-app.listen(process.env.PORT || 3000, () => {
-    console.log('🌐 Web service running to keep bot alive.');
-});
