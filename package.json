@@ -11,6 +11,9 @@
     "type": "git",
     "url": "git+https://github.com/LiKuei/Doerute-bot.git"
   },
+  "engines": {
+  "node": "20.18.1"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
