@@ -1,3 +1,4 @@
+process.env.YTDL_NO_UPDATE = 'true';
 require('dotenv').config(); // 載入 .env 環境變數
 
 const express = require('express'); // 保持 Render 活著用
@@ -89,6 +90,15 @@ function playNext(guildId) {
 
     queue.player.on('error', error => {
         console.error('📀 播放錯誤：', error.message);
+    
+        if (error.message.includes("Status code: 429")) {
+            // 提示用戶稍後再試
+            const channel = client.channels.cache.get(voiceChannel.id);
+            if (channel) {
+                channel.send('🚫 遭到 YouTube 限制，請稍後再試或使用不同連結。');
+            }
+        }
+    
         queue.songs.shift();
         playNext(guildId); // 嘗試播放下一首
     });
