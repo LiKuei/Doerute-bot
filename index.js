@@ -94,3 +94,12 @@ function playNext(guildId) {
 }
 
 client.login(process.env.DISCORD_TOKEN);
+
+// index.js 的最下面加入
+const express = require('express');
+const app = express();
+
+app.get('/', (req, res) => res.send('Bot is running!'));
+app.listen(process.env.PORT || 3000, () => {
+  console.log('Web service alive to keep Render happy.');
+});
