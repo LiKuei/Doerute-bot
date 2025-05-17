@@ -1,7 +1,7 @@
 process.env.YTDL_NO_UPDATE = 'true';
-require('dotenv').config(); // 載入 .env 環境變數
+require('dotenv').config();
 
-const express = require('express'); // 保持 Render 活著用
+const express = require('express');
 const { Client, GatewayIntentBits } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
 const ytdl = require("@distube/ytdl-core");
@@ -56,52 +56,110 @@ client.on('messageCreate', async message => {
         queue.connection.subscribe(queue.player);
     }
 
-    // 將歌曲加入佇列
-    queue.songs.push(url);
-    message.reply('🎵 已將歌曲加入播放佇列！');
+    try {
+        // 獲取視頻信息
+        const info = await ytdl.getInfo(url);
+        const title = info.videoDetails.title;
 
-    // 如果佇列中只有一首歌，開始播放
-    if (queue.songs.length === 1) {
-        playNext(message.guild.id);
+        // 將歌曲加入佇列
+        queue.songs.push({
+            url: url,
+            title: title
+        });
+        message.reply(`🎵 已將歌曲 **${title}** 加入播放佇列！`);
+
+        // 如果佇列中只有一首歌，開始播放
+        if (queue.songs.length === 1) {
+            playNext(message.guild.id);
+        }
+    } catch (error) {
+        console.error('處理歌曲錯誤:', error);
+        if (error.message.includes('Status code: 403')) {
+            message.reply('🚫 無法訪問該視頻，可能是因為視頻設定了年齡限制或地區限制。');
+        } else {
+            message.reply(`❌ 處理歌曲時發生錯誤: ${error.message}`);
+        }
     }
 });
 
 // 播放下一首歌的函數
-function playNext(guildId) {
+async function playNext(guildId) {
     const queue = queues.get(guildId);
     if (!queue || queue.songs.length === 0) return;
 
-    const url = queue.songs[0];
-    const stream = ytdl(url, {
-        filter: 'audioonly',
-        quality: 'highestaudio',
-        highWaterMark: 1 << 25
-    });
-    const resource = createAudioResource(stream);
-    
-    queue.player.play(resource);
+    try {
+        const song = queue.songs[0];
+        console.log('開始播放:', song.title);
 
-    queue.player.once(AudioPlayerStatus.Idle, () => {
-        queue.songs.shift(); // 移除已播放的歌曲
-        if (queue.songs.length > 0) {
-            playNext(guildId); // 播放下一首
-        }
-    });
+        const stream = ytdl(song.url, {
+            filter: 'audioonly',
+            quality: 'highestaudio',
+            highWaterMark: 1 << 25,
+            requestOptions: {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+            },
+            fmt: 'mp3',
+            opusEncoded: false
+        });
 
-    queue.player.on('error', error => {
-        console.error('📀 播放錯誤：', error.message);
-    
-        if (error.message.includes("Status code: 429")) {
-            // 提示用戶稍後再試
-            const channel = client.channels.cache.get(voiceChannel.id);
-            if (channel) {
-                channel.send('🚫 遭到 YouTube 限制，請稍後再試或使用不同連結。');
+        const resource = createAudioResource(stream, {
+            inputType: 'arbitrary',
+            inlineVolume: true
+        });
+
+        resource.volume?.setVolume(1);
+        queue.player.play(resource);
+
+        // 處理流錯誤
+        stream.on('error', error => {
+            console.error('流錯誤:', error);
+            queue.songs.shift();
+            if (queue.songs.length > 0) {
+                playNext(guildId);
             }
-        }
-    
+        });
+
+        queue.player.once(AudioPlayerStatus.Idle, () => {
+            queue.songs.shift(); // 移除已播放的歌曲
+            if (queue.songs.length > 0) {
+                playNext(guildId); // 播放下一首
+            }
+        });
+
+        queue.player.on('error', error => {
+            console.error('📀 播放錯誤：', error.message);
+            
+            if (error.message.includes("Status code: 403")) {
+                const channel = client.channels.cache.get(queue.connection.joinConfig.channelId);
+                if (channel) {
+                    channel.send('🚫 無法播放該視頻，可能是因為視頻設定了年齡限制或地區限制。');
+                }
+            } else if (error.message.includes("Status code: 429")) {
+                const channel = client.channels.cache.get(queue.connection.joinConfig.channelId);
+                if (channel) {
+                    channel.send('🚫 遭到 YouTube 限制，請稍後再試或使用不同連結。');
+                }
+            } else {
+                const channel = client.channels.cache.get(queue.connection.joinConfig.channelId);
+                if (channel) {
+                    channel.send('❌ 播放時發生錯誤，嘗試播放下一首歌曲。');
+                }
+            }
+            
+            queue.songs.shift();
+            if (queue.songs.length > 0) {
+                playNext(guildId); // 嘗試播放下一首
+            }
+        });
+    } catch (error) {
+        console.error('播放錯誤:', error);
         queue.songs.shift();
-        playNext(guildId); // 嘗試播放下一首
-    });
+        if (queue.songs.length > 0) {
+            playNext(guildId);
+        }
+    }
 }
 
 // 登入 Discord
