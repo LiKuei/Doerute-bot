@@ -1,0 +1,33 @@
+{
+  "name": "doerute-bot",
+  "version": "1.0.0",
+  "description": "這是一個自用的discord bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LiKuei/Doerute-bot.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/LiKuei/Doerute-bot/issues"
+  },
+  "homepage": "https://github.com/LiKuei/Doerute-bot#readme",
+  "dependencies": {
+    "@discord-player/extractor": "^7.1.0",
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/voice": "^0.16.1",
+    "@distube/ytdl-core": "^4.16.10",
+    "discord-player": "^7.1.0",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.3.1",
+    "ffmpeg-static": "^5.2.0",
+    "libsodium-wrappers": "^0.7.11",
+    "play-dl": "^1.9.7"
+  }
+}
