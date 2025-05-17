@@ -1,10 +1,11 @@
-require('dotenv').config();
-client.login(process.env.DISCORD_TOKEN);
+require('dotenv').config(); // 載入 .env 環境變數
+
+const express = require('express'); // 保持 Render 活著用
 const { Client, GatewayIntentBits } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
 const ytdl = require("@distube/ytdl-core");
-require('dotenv').config();
 
+// 建立 Discord Bot Client
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -72,34 +73,33 @@ function playNext(guildId) {
     const url = queue.songs[0];
     const stream = ytdl(url, {
         filter: 'audioonly',
-        quality: 'highestaudio', // 也可以試試 'lowestaudio'
-        highWaterMark: 1 << 25    // 增加 buffer，避免中斷
-      });
+        quality: 'highestaudio',
+        highWaterMark: 1 << 25
+    });
     const resource = createAudioResource(stream);
     
     queue.player.play(resource);
+
+    queue.player.once(AudioPlayerStatus.Idle, () => {
+        queue.songs.shift(); // 移除已播放的歌曲
+        if (queue.songs.length > 0) {
+            playNext(guildId); // 播放下一首
+        }
+    });
+
     queue.player.on('error', error => {
         console.error('📀 播放錯誤：', error.message);
         queue.songs.shift();
         playNext(guildId); // 嘗試播放下一首
-      });
-    // 當歌曲播放結束時
-    queue.player.once(AudioPlayerStatus.Idle, () => {
-        queue.songs.shift(); // 移除已播放的歌曲
-        if (queue.songs.length > 0) {
-            // 如果佇列中還有歌曲，播放下一首
-            playNext(guildId);
-        }
     });
 }
 
+// 登入 Discord
 client.login(process.env.DISCORD_TOKEN);
 
-// index.js 的最下面加入
-const express = require('express');
+// 建立 Express Web 服務，讓 Render 不會休眠
 const app = express();
-
 app.get('/', (req, res) => res.send('Bot is running!'));
 app.listen(process.env.PORT || 3000, () => {
-  console.log('Web service alive to keep Render happy.');
+    console.log('🌐 Web service running to keep bot alive.');
 });
