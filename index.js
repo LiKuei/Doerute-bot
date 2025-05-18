@@ -5,6 +5,7 @@ const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle,
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
 const ytdl = require("@distube/ytdl-core");
 const { client: gachaClient, gacha } = require('./gacha.js');
+const { sendMessage, clearChatHistory } = require('./gemini.js');
 
 // 建立 Discord Bot Client
 const client = new Client({
@@ -33,7 +34,17 @@ const commands = [
         .setDescription('🎮 顯示音樂控制面板'),
     new SlashCommandBuilder()
         .setName('抽卡')
-        .setDescription('🎲 進行抽卡')
+        .setDescription('🎲 進行抽卡'),
+    new SlashCommandBuilder()
+        .setName('chat')
+        .setDescription('💬 與 AI 對話')
+        .addStringOption(option =>
+            option.setName('message')
+                .setDescription('要發送的訊息')
+                .setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('clear_chat')
+        .setDescription('🧹 清除與 AI 的對話歷史')
 ].map(command => command.toJSON());
 
 // 註冊 Slash Commands
@@ -80,7 +91,54 @@ client.on('interactionCreate', async interaction => {
     // 檢查是否在指定的抽卡頻道
     const isGachaChannel = interaction.channelId === '1373289481804709978';
 
-    if (interaction.commandName === '抽卡') {
+    if (interaction.commandName === 'chat') {
+        const message = interaction.options.getString('message');
+        
+        // 先回應一個延遲訊息
+        await interaction.deferReply();
+
+        try {
+            // 創建一個嵌入訊息來顯示用戶的輸入
+            const userEmbed = new EmbedBuilder()
+                .setColor('#0099ff')
+                .setAuthor({ 
+                    name: interaction.user.username, 
+                    iconURL: interaction.user.displayAvatarURL() 
+                })
+                .setDescription(message)
+                .setTimestamp();
+
+            // 發送用戶的訊息
+            await interaction.editReply({ embeds: [userEmbed] });
+
+            // 獲取 AI 的回應
+            const response = await sendMessage(interaction.user.id, message);
+
+            // 創建一個嵌入訊息來顯示 AI 的回應
+            const aiEmbed = new EmbedBuilder()
+                .setColor('#00ff00')
+                .setAuthor({ 
+                    name: '朵爾忒', 
+                    iconURL: interaction.client.user.displayAvatarURL() 
+                })
+                .setDescription(response)
+                .setTimestamp();
+
+            // 發送 AI 的回應
+            await interaction.followUp({ embeds: [aiEmbed] });
+        } catch (error) {
+            console.error('聊天時發生錯誤：', error);
+            await interaction.editReply({ 
+                content: '❌ 處理訊息時發生錯誤，請稍後再試！'
+            });
+        }
+    } else if (interaction.commandName === 'clear_chat') {
+        clearChatHistory(interaction.user.id);
+        await interaction.reply({ 
+            content: '🧹 已清除與 AI 的對話歷史！',
+            flags: [1 << 6]
+        });
+    } else if (interaction.commandName === '抽卡') {
         if (!isGachaChannel) {
             return interaction.reply({ 
                 content: '❌ 抽卡指令只能在指定的抽卡頻道使用！',
