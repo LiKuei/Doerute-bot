@@ -44,7 +44,13 @@ const commands = [
                 .setRequired(true)),
     new SlashCommandBuilder()
         .setName('clear_chat')
-        .setDescription('🧹 清除與 AI 的對話歷史')
+        .setDescription('🧹 清除與 AI 的對話歷史'),
+    new SlashCommandBuilder()
+        .setName('join')
+        .setDescription('🎤 加入語音頻道'),
+    new SlashCommandBuilder()
+        .setName('leave')
+        .setDescription('👋 退出語音頻道')
 ].map(command => command.toJSON());
 
 // 註冊 Slash Commands
@@ -292,6 +298,79 @@ client.on('interactionCreate', async interaction => {
             components: [row],
             flags: [1 << 6]
         });
+    } else if (interaction.commandName === 'join') {
+        const voiceChannel = interaction.member.voice.channel;
+        if (!voiceChannel) {
+            return interaction.reply({ 
+                content: '❌ 你必須先加入語音頻道！',
+                flags: [1 << 6]
+            });
+        }
+
+        try {
+            // 取得或建立伺服器的佇列
+            if (!queues.has(interaction.guildId)) {
+                queues.set(interaction.guildId, {
+                    songs: [],
+                    connection: null,
+                    player: createAudioPlayer()
+                });
+            }
+
+            const queue = queues.get(interaction.guildId);
+
+            // 如果已經在語音頻道中，先斷開連接
+            if (queue.connection) {
+                queue.connection.destroy();
+            }
+
+            // 建立新的連接
+            queue.connection = joinVoiceChannel({
+                channelId: voiceChannel.id,
+                guildId: interaction.guildId,
+                adapterCreator: interaction.guild.voiceAdapterCreator,
+            });
+            queue.connection.subscribe(queue.player);
+
+            await interaction.reply({ 
+                content: `✅ 已加入語音頻道：${voiceChannel.name}`,
+                flags: [1 << 6]
+            });
+        } catch (error) {
+            console.error('加入語音頻道時發生錯誤：', error);
+            await interaction.reply({ 
+                content: '❌ 加入語音頻道時發生錯誤，請稍後再試！',
+                flags: [1 << 6]
+            });
+        }
+    } else if (interaction.commandName === 'leave') {
+        const queue = queues.get(interaction.guildId);
+        if (!queue || !queue.connection) {
+            return interaction.reply({ 
+                content: '❌ 機器人目前不在任何語音頻道中！',
+                flags: [1 << 6]
+            });
+        }
+
+        try {
+            // 停止播放器
+            queue.player.stop();
+            // 斷開連接
+            queue.connection.destroy();
+            // 清除佇列
+            queues.delete(interaction.guildId);
+
+            await interaction.reply({ 
+                content: '👋 已退出語音頻道！',
+                flags: [1 << 6]
+            });
+        } catch (error) {
+            console.error('退出語音頻道時發生錯誤：', error);
+            await interaction.reply({ 
+                content: '❌ 退出語音頻道時發生錯誤，請稍後再試！',
+                flags: [1 << 6]
+            });
+        }
     }
 });
 
