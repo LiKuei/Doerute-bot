@@ -1,7 +1,7 @@
 process.env.YTDL_NO_UPDATE = 'true';
 require('dotenv').config(); // 載入 .env 環境變數
 
-const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
 const ytdl = require("@distube/ytdl-core");
 const { client: gachaClient, gacha } = require('./gacha.js');
@@ -20,65 +20,8 @@ const client = new Client({
 // 建立一個 Map 來儲存每個伺服器的播放佇列
 const queues = new Map();
 
-// 定義 Slash Commands
-const commands = [
-    new SlashCommandBuilder()
-        .setName('play')
-        .setDescription('🎵 播放 YouTube 音樂')
-        .addStringOption(option =>
-            option.setName('url')
-                .setDescription('YouTube 影片連結')
-                .setRequired(true)),
-    new SlashCommandBuilder()
-        .setName('controls')
-        .setDescription('🎮 顯示音樂控制面板'),
-    new SlashCommandBuilder()
-        .setName('抽卡')
-        .setDescription('🎲 進行抽卡'),
-    new SlashCommandBuilder()
-        .setName('clear_chat')
-        .setDescription('🧹 清除與 AI 的對話歷史'),
-    new SlashCommandBuilder()
-        .setName('join')
-        .setDescription('🎤 加入語音頻道'),
-    new SlashCommandBuilder()
-        .setName('leave')
-        .setDescription('👋 退出語音頻道')
-].map(command => command.toJSON());
-
-// 註冊 Slash Commands
-const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-
-// 檢查是否需要註冊命令
-async function checkAndRegisterCommands() {
-    try {
-        // 獲取當前註冊的命令
-        const currentCommands = await rest.get(
-            Routes.applicationCommands(client.user.id)
-        );
-
-        // 檢查命令是否有變更
-        const needsUpdate = JSON.stringify(currentCommands) !== JSON.stringify(commands);
-
-        if (needsUpdate) {
-            console.log('檢測到命令變更，開始更新 Slash Commands...');
-            const data = await rest.put(
-                Routes.applicationCommands(client.user.id),
-                { body: commands }
-            );
-            console.log(`成功更新 ${data.length} 個 Slash Commands！`);
-            console.log('已註冊的命令：', data.map(cmd => cmd.name).join(', '));
-        } else {
-            console.log('Slash Commands 已是最新，無需更新。');
-        }
-    } catch (error) {
-        console.error('檢查或更新 Slash Commands 時發生錯誤：', error);
-    }
-}
-
-client.once('ready', async () => {
+client.once('ready', () => {
     console.log(`🤖 Bot 已上線: ${client.user.tag}`);
-    await checkAndRegisterCommands();
 });
 
 // 處理 Slash Commands
@@ -151,15 +94,7 @@ client.on('interactionCreate', async interaction => {
             const duration = formatDuration(info.videoDetails.lengthSeconds);
 
             // 取得或建立伺服器的佇列
-            if (!queues.has(interaction.guildId)) {
-                queues.set(interaction.guildId, {
-                    songs: [],
-                    connection: null,
-                    player: createAudioPlayer()
-                });
-            }
-
-            const queue = queues.get(interaction.guildId);
+            const queue = getOrCreateQueue(interaction);
 
             // 如果是第一首歌，建立連接
             if (!queue.connection) {
@@ -262,15 +197,7 @@ client.on('interactionCreate', async interaction => {
 
         try {
             // 取得或建立伺服器的佇列
-            if (!queues.has(interaction.guildId)) {
-                queues.set(interaction.guildId, {
-                    songs: [],
-                    connection: null,
-                    player: createAudioPlayer()
-                });
-            }
-
-            const queue = queues.get(interaction.guildId);
+            const queue = getOrCreateQueue(interaction);
 
             // 如果已經在語音頻道中，先斷開連接
             if (queue.connection) {
@@ -310,6 +237,10 @@ client.on('interactionCreate', async interaction => {
             queue.player.stop();
             // 斷開連接
             queue.connection.destroy();
+            // 清除閒置計時器
+            if (queue.idleTimeout) {
+                clearTimeout(queue.idleTimeout);
+            }
             // 清除佇列
             queues.delete(interaction.guildId);
 
@@ -393,10 +324,85 @@ function formatDuration(seconds) {
     return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
 }
 
+// 建立或取得伺服器音樂佇列的輔助函數
+function getOrCreateQueue(interaction) {
+    let queue = queues.get(interaction.guildId);
+    if (!queue) {
+        queue = {
+            songs: [],
+            connection: null,
+            player: createAudioPlayer(),
+            textChannel: interaction.channel,
+            idleTimeout: null
+        };
+        queues.set(interaction.guildId, queue);
+        setupPlayerListeners(queue, interaction.guildId);
+    } else {
+        // 更新為最新的文字頻道，以利狀態訊息能發送在正確頻道
+        queue.textChannel = interaction.channel;
+    }
+    return queue;
+}
+
+// 設定音樂播放器的監聽器（只在 Player 建立時設定一次，避免重複註冊導致記憶體洩漏與重複輸出）
+function setupPlayerListeners(queue, guildId) {
+    queue.player.on(AudioPlayerStatus.Playing, () => {
+        console.log(`[Music] Guild ${guildId} 開始播放音樂`);
+    });
+
+    queue.player.on(AudioPlayerStatus.Paused, () => {
+        console.log(`[Music] Guild ${guildId} 音樂已暫停`);
+    });
+
+    queue.player.on(AudioPlayerStatus.Idle, () => {
+        // 移除已播放完畢的歌
+        queue.songs.shift(); 
+        
+        if (queue.songs.length > 0) {
+            playNext(guildId); // 播放下一首
+        } else {
+            console.log(`[Music] Guild ${guildId} 播放清單已空，啟動 5 分鐘閒置計時器`);
+            // 佇列空了，設定 5 分鐘後自動退出頻道
+            queue.idleTimeout = setTimeout(() => {
+                const currentQueue = queues.get(guildId);
+                if (currentQueue && currentQueue.connection) {
+                    currentQueue.connection.destroy();
+                    queues.delete(guildId);
+                    if (currentQueue.textChannel) {
+                        currentQueue.textChannel.send('👋 閒置時間過長，已自動退出語音頻道。');
+                    }
+                }
+            }, 300000); // 5 分鐘
+        }
+    });
+
+    queue.player.on('error', error => {
+        console.error(`[Music] Guild ${guildId} 播放錯誤：`, error.message);
+        
+        if (queue.textChannel) {
+            if (error.message.includes("Status code: 429")) {
+                queue.textChannel.send('🚫 遭到 YouTube 限制 (429)，請稍後再試或使用不同連結。');
+            } else {
+                queue.textChannel.send(`❌ 播放歌曲時發生錯誤：${error.message}`);
+            }
+        }
+        
+        // 遇到錯誤，移除該首並嘗試播下一首
+        queue.songs.shift();
+        playNext(guildId);
+    });
+}
+
 // 播放下一首歌的函數
 function playNext(guildId) {
     const queue = queues.get(guildId);
     if (!queue || queue.songs.length === 0) return;
+
+    // 若有閒置計時器，清除它
+    if (queue.idleTimeout) {
+        clearTimeout(queue.idleTimeout);
+        queue.idleTimeout = null;
+    }
 
     const song = queue.songs[0];
     const stream = ytdl(song.url, {
@@ -414,36 +420,10 @@ function playNext(guildId) {
     
     queue.player.play(resource);
 
-    // 添加播放狀態監聽
-    queue.player.on(AudioPlayerStatus.Playing, () => {
-        console.log('開始播放音樂');
-    });
-
-    queue.player.on(AudioPlayerStatus.Paused, () => {
-        console.log('音樂已暫停');
-    });
-
-    queue.player.once(AudioPlayerStatus.Idle, () => {
-        queue.songs.shift(); // 移除已播放的歌曲
-        if (queue.songs.length > 0) {
-            playNext(guildId); // 播放下一首
-        }
-    });
-
-    queue.player.on('error', error => {
-        console.error('📀 播放錯誤：', error.message);
-    
-        if (error.message.includes("Status code: 429")) {
-            // 提示用戶稍後再試
-            const channel = client.channels.cache.get(voiceChannel.id);
-            if (channel) {
-                channel.send('🚫 遭到 YouTube 限制，請稍後再試或使用不同連結。');
-            }
-        }
-    
-        queue.songs.shift();
-        playNext(guildId); // 嘗試播放下一首
-    });
+    // 發送現在播放訊息
+    if (queue.textChannel) {
+        queue.textChannel.send(`🎶 **現在播放：** ${song.title} (${song.duration})`);
+    }
 }
 
 // 處理訊息事件以進行 AI 對話 (透過 @提及 啟動討論串，並在討論串中持續對話)
@@ -518,30 +498,32 @@ client.on('messageCreate', async message => {
             chatSessionId = thread.id; // 新對話的 Session ID 設為該討論串 ID
         }
 
-        // 在目標討論串/頻道中顯示打字狀態
-        await targetChannel.sendTyping();
+        let replyMessage;
 
-        // 獲取 AI 的回應 (使用 chatSessionId 作為對話識別碼，message.author.id 用於判定系統提示)
-        const response = await sendMessage(chatSessionId, message.author.id, prompt);
-
-        // 如果是新對話，我們在討論串中直接發送訊息
+        // 建立初始的「思考中」訊息
         if (isNewConversation) {
-            await targetChannel.send({
-                content: response
-            });
+            replyMessage = await targetChannel.send('朵爾忒正在思考中……');
         } else {
-            // 如果本來就在討論串中，用 reply 回覆該則訊息
-            await message.reply({
-                content: response,
+            replyMessage = await message.reply({
+                content: '朵爾忒正在思考中……',
                 allowedMentions: { repliedUser: true }
             });
         }
+
+        // 獲取 AI 的回應 (使用 chatSessionId 作為對話識別碼，並透過 progress callback 串流更新訊息)
+        const response = await sendMessage(chatSessionId, message.author.id, prompt, (currentText) => {
+            replyMessage.edit({ content: currentText }).catch(console.error);
+        });
+
+        // 結束後，更新為最終且完整的內容
+        await replyMessage.edit({ content: response }).catch(console.error);
     } catch (error) {
         console.error('訊息聊天時發生錯誤：', error);
-        if (isThread) {
-            await message.reply('❌ 抱歉，我現在無法處理您的訊息，請稍後再試！');
+        const errMsg = '❌ 抱歉，我現在處理您的訊息時遇到了錯誤，請稍後再試！';
+        if (replyMessage) {
+            await replyMessage.edit({ content: errMsg }).catch(console.error);
         } else {
-            await message.reply('❌ 建立討論串或處理訊息時發生錯誤，請稍後再試！');
+            await message.reply(errMsg).catch(console.error);
         }
     }
 });

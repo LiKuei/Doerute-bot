@@ -47,7 +47,12 @@
    OLLAMA_MODEL=qwen2.5:3b  # 替換成你本地運行的 Ollama 模型名稱
    ```
 
-3. **啟動 Bot**
+3. **註冊/更新 Slash 指令** (僅在初次部署或指令定義有修改時需要執行一次)
+   ```bash
+   npm run deploy
+   ```
+
+4. **啟動 Bot**
    ```bash
    npm start
    ```

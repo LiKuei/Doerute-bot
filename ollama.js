@@ -1,5 +1,30 @@
+const { Readable } = require('stream');
+const readline = require('readline');
+
 // Store chat history for each user
 const chatHistory = new Map();
+
+/**
+ * Helper function to format thinking content dynamically for Discord
+ * Wrap the `<think>` tag contents in Discord spoiler `||` tags, allowing real-time streaming formats
+ */
+function formatThinking(text) {
+    const hasCompleteThink = text.includes('</think>');
+    const hasStartThink = text.includes('<think>');
+
+    if (hasStartThink) {
+        if (hasCompleteThink) {
+            return text.replace(/<think>([\s\S]*?)<\/think>/g, (match, p1) => {
+                return `||**[思考過程]**\n${p1.trim()}||\n`;
+            }).trim();
+        } else {
+            // 還在思考中，將目前已有的思考內容包裹在隱藏標籤，並提示正在思考
+            const thinkContent = text.split('<think>')[1] || '';
+            return `||**[思考中...]**\n${thinkContent.trim()}||\n*(正在思考中...)*`;
+        }
+    }
+    return text;
+}
 
 /**
  * Initialize a new chat session for a thread/user
@@ -16,9 +41,10 @@ function initializeChat(sessionId) {
  * @param {string} sessionId - Chat session ID (thread ID or user ID)
  * @param {string} userId - Discord user ID
  * @param {string} message - User's message
+ * @param {Function} onProgress - Callback function for stream updates (optional)
  * @returns {Promise<string>} - Ollama's response
  */
-async function sendMessage(sessionId, userId, message) {
+async function sendMessage(sessionId, userId, message, onProgress) {
     try {
         // Initialize chat if it doesn't exist
         initializeChat(sessionId);
@@ -54,6 +80,7 @@ async function sendMessage(sessionId, userId, message) {
         const host = process.env.OLLAMA_HOST || 'http://localhost:11434';
         const model = process.env.OLLAMA_MODEL || 'qwen2.5:3b';
 
+        // 啟動 Stream 模式以獲取流式輸出
         const response = await fetch(`${host}/api/chat`, {
             method: 'POST',
             headers: {
@@ -62,7 +89,7 @@ async function sendMessage(sessionId, userId, message) {
             body: JSON.stringify({
                 model: model,
                 messages: messages,
-                stream: false,
+                stream: true,
                 options: {
                     temperature: 0.7,
                     top_p: 0.8,
@@ -76,30 +103,51 @@ async function sendMessage(sessionId, userId, message) {
             throw new Error(`Ollama API error: ${response.statusText} (${errText})`);
         }
 
-        const data = await response.json();
-        let assistantResponse = data.message?.content || '';
-        console.log(`[Ollama] 原始回覆長度: ${assistantResponse.length} 字元`);
+        // 將 Web Stream 轉為 Node Readable 串流以支援 readline
+        const nodeReadable = Readable.fromWeb(response.body);
+        const rl = readline.createInterface({
+            input: nodeReadable,
+            crlfDelay: Infinity
+        });
 
-        // 如果回覆為空，給予預設提示以避免 Discord 報錯
-        if (!assistantResponse.trim()) {
-            return '（本地模型未回覆任何內容，請重試或確認模型狀態）';
+        let currentText = '';
+        let lastEditTime = Date.now();
+
+        for await (const line of rl) {
+            if (!line.trim()) continue;
+            try {
+                const parsed = JSON.parse(line);
+                const chunk = parsed.message?.content || '';
+                currentText += chunk;
+
+                // 每隔 1.5 秒更新一次 Discord 訊息，避免觸發 Discord rate limit
+                if (onProgress && Date.now() - lastEditTime > 1500) {
+                    const formattedText = formatThinking(currentText);
+                    if (formattedText.trim()) {
+                        onProgress(formattedText);
+                    }
+                    lastEditTime = Date.now();
+                }
+            } catch (err) {
+                console.error('[Ollama] 解析串流 JSON 行失敗:', err.message);
+            }
         }
 
         // 提取不含思考過程的乾淨內容，存入對話歷史以節省 Context Token
-        const cleanResponse = assistantResponse.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-        history.push({ role: 'assistant', content: cleanResponse });
-
-        // 將 <think> 標籤轉換為 Discord 的隱藏標籤 (||) 以供前台點閱
-        assistantResponse = assistantResponse.replace(/<think>([\s\S]*?)<\/think>/g, (match, p1) => {
-            return `||**[思考過程]**\n${p1.trim()}||\n`;
-        }).trim();
-
-        // 再次確保轉換後內容不為空 (例如原本只有 think 區塊被處理後 trim 掉的情況)
-        if (!assistantResponse.trim()) {
-            return '（模型僅進行了思考，未輸出最終回覆內容）';
+        const cleanResponse = currentText.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+        
+        if (cleanResponse) {
+            history.push({ role: 'assistant', content: cleanResponse });
+        } else {
+            history.push({ role: 'assistant', content: '（本地模型未回覆任何內容）' });
         }
 
-        return assistantResponse;
+        const finalFormatted = formatThinking(currentText);
+        if (!finalFormatted.trim()) {
+            return '（本地模型未回覆任何內容，請重試或確認模型狀態）';
+        }
+
+        return finalFormatted;
     } catch (error) {
         console.error('Error in Ollama chat:', error);
 
