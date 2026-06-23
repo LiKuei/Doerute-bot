@@ -5,7 +5,7 @@ const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle,
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
 const ytdl = require("@distube/ytdl-core");
 const { client: gachaClient, gacha } = require('./gacha.js');
-const { sendMessage, clearChatHistory } = require('./gemini.js');
+const { sendMessage, clearChatHistory } = require('./ollama.js');
 
 // 建立 Discord Bot Client
 const client = new Client({
@@ -35,13 +35,6 @@ const commands = [
     new SlashCommandBuilder()
         .setName('抽卡')
         .setDescription('🎲 進行抽卡'),
-    new SlashCommandBuilder()
-        .setName('chat')
-        .setDescription('💬 與 AI 對話')
-        .addStringOption(option =>
-            option.setName('message')
-                .setDescription('要發送的訊息')
-                .setRequired(true)),
     new SlashCommandBuilder()
         .setName('clear_chat')
         .setDescription('🧹 清除與 AI 的對話歷史'),
@@ -97,51 +90,11 @@ client.on('interactionCreate', async interaction => {
     // 檢查是否在指定的抽卡頻道
     const isGachaChannel = interaction.channelId === '1373289481804709978';
 
-    if (interaction.commandName === 'chat') {
-        const message = interaction.options.getString('message');
-        
-        // 先回應一個延遲訊息
-        await interaction.deferReply();
-
-        try {
-            // 創建一個嵌入訊息來顯示用戶的輸入
-            const userEmbed = new EmbedBuilder()
-                .setColor('#0099ff')
-                .setAuthor({ 
-                    name: interaction.user.username, 
-                    iconURL: interaction.user.displayAvatarURL() 
-                })
-                .setDescription(message)
-                .setTimestamp();
-
-            // 發送用戶的訊息
-            await interaction.editReply({ embeds: [userEmbed] });
-
-            // 獲取 AI 的回應
-            const response = await sendMessage(interaction.user.id, message);
-
-            // 創建一個嵌入訊息來顯示 AI 的回應
-            const aiEmbed = new EmbedBuilder()
-                .setColor('#00ff00')
-                .setAuthor({ 
-                    name: '朵爾忒', 
-                    iconURL: interaction.client.user.displayAvatarURL() 
-                })
-                .setDescription(response)
-                .setTimestamp();
-
-            // 發送 AI 的回應
-            await interaction.followUp({ embeds: [aiEmbed] });
-        } catch (error) {
-            console.error('聊天時發生錯誤：', error);
-            await interaction.editReply({ 
-                content: '❌ 處理訊息時發生錯誤，請稍後再試！'
-            });
-        }
-    } else if (interaction.commandName === 'clear_chat') {
-        clearChatHistory(interaction.user.id);
+    if (interaction.commandName === 'clear_chat') {
+        const clearId = interaction.channel.isThread() ? interaction.channelId : interaction.user.id;
+        clearChatHistory(clearId);
         await interaction.reply({ 
-            content: '🧹 已清除與 AI 的對話歷史！',
+            content: '🧹 已清除當前對話歷史！',
             flags: [1 << 6]
         });
     } else if (interaction.commandName === '抽卡') {
@@ -492,6 +445,119 @@ function playNext(guildId) {
         playNext(guildId); // 嘗試播放下一首
     });
 }
+
+// 處理訊息事件以進行 AI 對話 (透過 @提及 啟動討論串，並在討論串中持續對話)
+client.on('messageCreate', async message => {
+    // 忽略機器人發送的訊息
+    if (message.author.bot) return;
+
+    // 檢查目前訊息是否在討論串 (Thread) 中
+    const isThread = message.channel.isThread();
+
+    let shouldRespond = false;
+    let isNewConversation = false;
+
+    if (isThread) {
+        // 如果在討論串中，且該討論串是機器人創立的，或者機器人在裡面被 ping，就進行回覆
+        if (message.channel.ownerId === client.user.id) {
+            shouldRespond = true;
+        } else if (message.mentions.has(client.user.id) && !message.mentions.everyone) {
+            shouldRespond = true;
+        }
+    } else {
+        // 如果在一般頻道中，只有當被 @ 提及時才開啟新對話（討論串）
+        const isMentioned = message.mentions.has(client.user.id) && !message.mentions.everyone;
+        if (isMentioned) {
+            shouldRespond = true;
+            isNewConversation = true;
+        }
+    }
+
+    if (!shouldRespond) return;
+
+    // 取得使用者輸入的內容，並移除機器人的提及標籤
+    let prompt = message.content;
+    const mentionRegex = new RegExp(`<@!?${client.user.id}>`, 'g');
+    prompt = prompt.replace(mentionRegex, '').trim();
+
+    // 決定使用哪個 ID 來追蹤對話歷史
+    // 如果是討論串，我們使用 threadId (message.channel.id) 追蹤，使討論串內的角色與脈絡獨立
+    // 如果不是，先暫用 userId (message.author.id)
+    let chatSessionId = isThread ? message.channel.id : message.author.id;
+
+    // 如果是指令 "清除" 或 "clear"，清除該對話歷史紀錄
+    if (prompt.toLowerCase() === 'clear' || prompt === '清除') {
+        clearChatHistory(chatSessionId);
+        return message.reply('🧹 已成功清除當前主題的對話歷史紀錄！');
+    }
+
+    // 如果只提及了機器人但沒有輸入其他內容
+    if (!prompt) {
+        if (!isThread && message.mentions.has(client.user.id)) {
+            return message.reply('找我嗎？有什麼我可以幫忙的？');
+        }
+        return;
+    }
+
+    try {
+        let targetChannel = message.channel;
+
+        // 如果是新對話且不在討論串中，我們主動建立一個討論串
+        if (isNewConversation) {
+            // 建立討論串 (名稱最多 100 字，取 prompt 的前 20 字)
+            const threadName = `💬 AI對話 - ${prompt.substring(0, 20)}${prompt.length > 20 ? '...' : ''}`;
+            
+            // 在原訊息下建立一個討論串
+            const thread = await message.startThread({
+                name: threadName,
+                autoArchiveDuration: 60, // 60 分鐘沒人發言就自動封存
+                reason: '與 AI 對話的討論串'
+            });
+
+            targetChannel = thread;
+            chatSessionId = thread.id; // 新對話的 Session ID 設為該討論串 ID
+        }
+
+        // 在目標討論串/頻道中顯示打字狀態
+        await targetChannel.sendTyping();
+
+        // 獲取 AI 的回應 (使用 chatSessionId 作為對話識別碼，message.author.id 用於判定系統提示)
+        const response = await sendMessage(chatSessionId, message.author.id, prompt);
+
+        // 如果是新對話，我們在討論串中直接發送訊息
+        if (isNewConversation) {
+            await targetChannel.send({
+                content: response
+            });
+        } else {
+            // 如果本來就在討論串中，用 reply 回覆該則訊息
+            await message.reply({
+                content: response,
+                allowedMentions: { repliedUser: true }
+            });
+        }
+    } catch (error) {
+        console.error('訊息聊天時發生錯誤：', error);
+        if (isThread) {
+            await message.reply('❌ 抱歉，我現在無法處理您的訊息，請稍後再試！');
+        } else {
+            await message.reply('❌ 建立討論串或處理訊息時發生錯誤，請稍後再試！');
+        }
+    }
+});
+
+// 當討論串被封存或刪除時，自動清除記憶體中的對話歷史，防止記憶體洩漏
+client.on('threadUpdate', (oldThread, newThread) => {
+    if (newThread.archived && !oldThread.archived) {
+        clearChatHistory(newThread.id);
+        console.log(`[AI Chat] 討論串 ${newThread.id} 已被封存，已自動清除對話歷史。`);
+    }
+});
+
+client.on('threadDelete', thread => {
+    clearChatHistory(thread.id);
+    console.log(`[AI Chat] 討論串 ${thread.id} 已被刪除，已自動清除對話歷史。`);
+});
 
 // 登入 Discord
 client.login(process.env.DISCORD_TOKEN);
