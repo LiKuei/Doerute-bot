@@ -2,10 +2,64 @@ process.env.YTDL_NO_UPDATE = 'true';
 require('dotenv').config(); // 載入 .env 環境變數
 
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
-const ytdl = require("@distube/ytdl-core");
-const { client: gachaClient, gacha } = require('./gacha.js');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, entersState, VoiceConnectionStatus } = require('@discordjs/voice');
+const { spawn } = require('child_process');
+const path = require('path');
+const { gacha } = require('./gacha.js');
 const { sendMessage, clearChatHistory } = require('./ollama.js');
+
+function getYtDlpPath() {
+    return path.join(process.cwd(), 'node_modules', 'youtube-dl-exec', 'bin', 'yt-dlp.exe');
+}
+
+function runYtDlp(args) {
+    return new Promise((resolve, reject) => {
+        const proc = spawn(getYtDlpPath(), args);
+        let stdout = '';
+        let stderr = '';
+
+        proc.stdout.on('data', chunk => {
+            stdout += chunk;
+        });
+
+        proc.stderr.on('data', chunk => {
+            stderr += chunk;
+        });
+
+        proc.on('error', reject);
+        proc.on('close', code => {
+            if (code !== 0) {
+                return reject(new Error(`yt-dlp 執行失敗 (${code})：${stderr.trim().slice(-300)}`));
+            }
+            resolve(stdout.trim());
+        });
+    });
+}
+
+async function getYoutubeVideoInfo(url) {
+    const output = await runYtDlp([url, '--dump-json', '--no-playlist', '--no-warnings']);
+    const meta = JSON.parse(output);
+
+    return {
+        title: meta.title || '未知標題',
+        durationSeconds: meta.duration || 0
+    };
+}
+
+async function getYoutubeStreamUrl(url) {
+    return runYtDlp([
+        url,
+        '--get-url',
+        '--format',
+        'bestaudio[ext=webm]/bestaudio',
+        '--no-playlist',
+        '--no-warnings'
+    ]);
+}
+
+function validateYoutubeURL(url) {
+    return /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+$/.test(url);
+}
 
 // 建立 Discord Bot Client
 const client = new Client({
@@ -36,13 +90,13 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'clear_chat') {
         const clearId = interaction.channel.isThread() ? interaction.channelId : interaction.user.id;
         clearChatHistory(clearId);
-        await interaction.reply({ 
+        await interaction.reply({
             content: '🧹 已清除當前對話歷史！',
             flags: [1 << 6]
         });
     } else if (interaction.commandName === '抽卡') {
         if (!isGachaChannel) {
-            return interaction.reply({ 
+            return interaction.reply({
                 content: '❌ 抽卡指令只能在指定的抽卡頻道使用！',
                 flags: [1 << 6]
             });
@@ -50,27 +104,27 @@ client.on('interactionCreate', async interaction => {
 
         try {
             const result = await gacha(interaction.guild);
-            await interaction.reply({ 
+            await interaction.reply({
                 content: result
             });
         } catch (error) {
             console.error('抽卡時發生錯誤：', error);
-            await interaction.reply({ 
+            await interaction.reply({
                 content: '❌ 抽卡時發生錯誤，請稍後再試！',
                 flags: [1 << 6]
             });
         }
     } else if (interaction.commandName === 'play') {
-        if (!isMusicChannel) {
-            return interaction.reply({ 
-                content: '❌ 音樂指令只能在指定的音樂頻道使用！',
-                flags: [1 << 6]
-            });
-        }
+        // if (!isMusicChannel) {
+        //     return interaction.reply({
+        //         content: '❌ 音樂指令只能在指定的音樂頻道使用！',
+        //         flags: [1 << 6]
+        //     });
+        // }
 
         const url = interaction.options.getString('url');
-        if (!ytdl.validateURL(url)) {
-            return interaction.reply({ 
+        if (!validateYoutubeURL(url)) {
+            return interaction.reply({
                 content: '請提供一個有效的 YouTube 連結！',
                 flags: [1 << 6]
             });
@@ -78,7 +132,7 @@ client.on('interactionCreate', async interaction => {
 
         const voiceChannel = interaction.member.voice.channel;
         if (!voiceChannel) {
-            return interaction.reply({ 
+            return interaction.reply({
                 content: '你必須先加入語音頻道！',
                 flags: [1 << 6]
             });
@@ -89,9 +143,9 @@ client.on('interactionCreate', async interaction => {
 
         try {
             // 獲取影片資訊
-            const info = await ytdl.getInfo(url);
-            const videoTitle = info.videoDetails.title;
-            const duration = formatDuration(info.videoDetails.lengthSeconds);
+            const info = await getYoutubeVideoInfo(url);
+            const videoTitle = info.title;
+            const duration = formatDuration(info.durationSeconds);
 
             // 取得或建立伺服器的佇列
             const queue = getOrCreateQueue(interaction);
@@ -102,7 +156,17 @@ client.on('interactionCreate', async interaction => {
                     channelId: voiceChannel.id,
                     guildId: interaction.guildId,
                     adapterCreator: interaction.guild.voiceAdapterCreator,
+                    selfDeaf: true,
+                    selfMute: false
                 });
+
+                queue.connection.on('stateChange', (oldState, newState) => {
+                    console.log(`[Voice] Guild ${interaction.guildId} ${oldState.status} -> ${newState.status}`);
+                    if (newState.status === VoiceConnectionStatus.Ready) {
+                        console.log(`[Voice] Guild ${interaction.guildId} Connection Ready!`);
+                    }
+                });
+
                 queue.connection.subscribe(queue.player);
             }
 
@@ -133,8 +197,8 @@ client.on('interactionCreate', async interaction => {
                 );
 
             // 編輯延遲訊息
-            await interaction.editReply({ 
-                embeds: [embed], 
+            await interaction.editReply({
+                embeds: [embed],
                 components: [row]
             });
 
@@ -145,13 +209,13 @@ client.on('interactionCreate', async interaction => {
 
         } catch (error) {
             console.error('獲取影片資訊時發生錯誤：', error);
-            await interaction.editReply({ 
+            await interaction.editReply({
                 content: '❌ 無法獲取影片資訊，請稍後再試！'
             });
         }
     } else if (interaction.commandName === 'controls') {
         if (!isMusicChannel) {
-            return interaction.reply({ 
+            return interaction.reply({
                 content: '❌ 音樂指令只能在指定的音樂頻道使用！',
                 flags: [1 << 6]
             });
@@ -159,7 +223,7 @@ client.on('interactionCreate', async interaction => {
 
         const queue = queues.get(interaction.guildId);
         if (!queue || !queue.player) {
-            return interaction.reply({ 
+            return interaction.reply({
                 content: '目前沒有正在播放的音樂！',
                 flags: [1 << 6]
             });
@@ -181,15 +245,15 @@ client.on('interactionCreate', async interaction => {
                     .setStyle(ButtonStyle.Primary)
             );
 
-        await interaction.reply({ 
-            content: '🎵 音樂控制面板', 
+        await interaction.reply({
+            content: '🎵 音樂控制面板',
             components: [row],
             flags: [1 << 6]
         });
     } else if (interaction.commandName === 'join') {
         const voiceChannel = interaction.member.voice.channel;
         if (!voiceChannel) {
-            return interaction.reply({ 
+            return interaction.reply({
                 content: '❌ 你必須先加入語音頻道！',
                 flags: [1 << 6]
             });
@@ -209,16 +273,18 @@ client.on('interactionCreate', async interaction => {
                 channelId: voiceChannel.id,
                 guildId: interaction.guildId,
                 adapterCreator: interaction.guild.voiceAdapterCreator,
+                selfDeaf: true,
+                selfMute: false
             });
             queue.connection.subscribe(queue.player);
 
-            await interaction.reply({ 
+            await interaction.reply({
                 content: `✅ 已加入語音頻道：${voiceChannel.name}`,
                 flags: [1 << 6]
             });
         } catch (error) {
             console.error('加入語音頻道時發生錯誤：', error);
-            await interaction.reply({ 
+            await interaction.reply({
                 content: '❌ 加入語音頻道時發生錯誤，請稍後再試！',
                 flags: [1 << 6]
             });
@@ -226,7 +292,7 @@ client.on('interactionCreate', async interaction => {
     } else if (interaction.commandName === 'leave') {
         const queue = queues.get(interaction.guildId);
         if (!queue || !queue.connection) {
-            return interaction.reply({ 
+            return interaction.reply({
                 content: '❌ 機器人目前不在任何語音頻道中！',
                 flags: [1 << 6]
             });
@@ -244,13 +310,13 @@ client.on('interactionCreate', async interaction => {
             // 清除佇列
             queues.delete(interaction.guildId);
 
-            await interaction.reply({ 
+            await interaction.reply({
                 content: '👋 已退出語音頻道！',
                 flags: [1 << 6]
             });
         } catch (error) {
             console.error('退出語音頻道時發生錯誤：', error);
-            await interaction.reply({ 
+            await interaction.reply({
                 content: '❌ 退出語音頻道時發生錯誤，請稍後再試！',
                 flags: [1 << 6]
             });
@@ -264,8 +330,8 @@ client.on('interactionCreate', async interaction => {
 
     const queue = queues.get(interaction.guildId);
     if (!queue || !queue.player) {
-        return interaction.reply({ 
-            content: '目前沒有正在播放的音樂！', 
+        return interaction.reply({
+            content: '目前沒有正在播放的音樂！',
             flags: [1 << 6]
         });
     }
@@ -274,43 +340,43 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
             .setColor('#0099ff')
             .setTitle('🎵 播放序列')
-            .setDescription(queue.songs.map((song, index) => 
+            .setDescription(queue.songs.map((song, index) =>
                 `${index + 1}. ${song.title} (${song.duration})`
             ).join('\n'));
 
-        await interaction.reply({ 
-            embeds: [embed], 
+        await interaction.reply({
+            embeds: [embed],
             flags: [1 << 6]
         });
     } else if (interaction.customId === 'skip') {
         queue.player.stop();
-        await interaction.reply({ 
-            content: '⏭️ 已跳過當前歌曲', 
+        await interaction.reply({
+            content: '⏭️ 已跳過當前歌曲',
             flags: [1 << 6]
         });
     } else if (interaction.customId === 'pause') {
         if (queue.player.state.status === AudioPlayerStatus.Playing) {
             queue.player.pause();
-            await interaction.reply({ 
-                content: '⏸️ 已暫停播放', 
+            await interaction.reply({
+                content: '⏸️ 已暫停播放',
                 flags: [1 << 6]
             });
         } else {
-            await interaction.reply({ 
-                content: '❌ 音樂已經暫停了', 
+            await interaction.reply({
+                content: '❌ 音樂已經暫停了',
                 flags: [1 << 6]
             });
         }
     } else if (interaction.customId === 'resume') {
         if (queue.player.state.status === AudioPlayerStatus.Paused) {
             queue.player.unpause();
-            await interaction.reply({ 
-                content: '▶️ 已繼續播放', 
+            await interaction.reply({
+                content: '▶️ 已繼續播放',
                 flags: [1 << 6]
             });
         } else {
-            await interaction.reply({ 
-                content: '❌ 音樂正在播放中', 
+            await interaction.reply({
+                content: '❌ 音樂正在播放中',
                 flags: [1 << 6]
             });
         }
@@ -356,8 +422,8 @@ function setupPlayerListeners(queue, guildId) {
 
     queue.player.on(AudioPlayerStatus.Idle, () => {
         // 移除已播放完畢的歌
-        queue.songs.shift(); 
-        
+        queue.songs.shift();
+
         if (queue.songs.length > 0) {
             playNext(guildId); // 播放下一首
         } else {
@@ -378,7 +444,7 @@ function setupPlayerListeners(queue, guildId) {
 
     queue.player.on('error', error => {
         console.error(`[Music] Guild ${guildId} 播放錯誤：`, error.message);
-        
+
         if (queue.textChannel) {
             if (error.message.includes("Status code: 429")) {
                 queue.textChannel.send('🚫 遭到 YouTube 限制 (429)，請稍後再試或使用不同連結。');
@@ -386,7 +452,7 @@ function setupPlayerListeners(queue, guildId) {
                 queue.textChannel.send(`❌ 播放歌曲時發生錯誤：${error.message}`);
             }
         }
-        
+
         // 遇到錯誤，移除該首並嘗試播下一首
         queue.songs.shift();
         playNext(guildId);
@@ -394,7 +460,7 @@ function setupPlayerListeners(queue, guildId) {
 }
 
 // 播放下一首歌的函數
-function playNext(guildId) {
+async function playNext(guildId) {
     const queue = queues.get(guildId);
     if (!queue || queue.songs.length === 0) return;
 
@@ -405,26 +471,51 @@ function playNext(guildId) {
     }
 
     const song = queue.songs[0];
-    const stream = ytdl(song.url, {
-        filter: 'audioonly',
-        quality: 'highestaudio',
-        highWaterMark: 1 << 25
-    });
-    const resource = createAudioResource(stream, {
-        inputType: 'arbitrary',
-        inlineVolume: true
-    });
-    
-    // 設置音量為 50%
-    resource.volume.setVolume(0.5);
-    
-    queue.player.play(resource);
 
-    // 發送現在播放訊息
-    if (queue.textChannel) {
-        queue.textChannel.send(`🎶 **現在播放：** ${song.title} (${song.duration})`);
+    try {
+        if (!queue.connection) {
+            throw new Error('尚未建立語音連線，請先讓 bot 加入語音頻道。');
+        }
+
+        if (queue.connection && queue.connection.state.status !== VoiceConnectionStatus.Ready) {
+            try {
+                await entersState(queue.connection, VoiceConnectionStatus.Ready, 20000);
+            } catch (error) {
+                console.warn(`[Voice] Guild ${guildId} 語音連線尚未 Ready：${error.message}`);
+                try {
+                    queue.connection.destroy();
+                } catch (destroyError) {
+                    console.warn(`[Voice] Guild ${guildId} 清理語音連線失敗：${destroyError.message}`);
+                }
+                queue.connection = null;
+                throw new Error('語音連線逾時，請確認 bot 有連線與說話權限後再試一次。');
+            }
+        }
+
+        const streamUrl = await getYoutubeStreamUrl(song.url);
+
+        const resource = createAudioResource(streamUrl, {
+            inlineVolume: true,
+            silencePaddingFrames: 0
+        });
+
+        resource.volume.setVolume(0.5);
+        queue.player.play(resource);
+
+        if (queue.textChannel) {
+            queue.textChannel.send(`🎶 **現在播放：** ${song.title} (${song.duration})`);
+        }
+
+    } catch (error) {
+        console.error(`[Music] Guild ${guildId} 播放準備出錯:`, error.message);
+        if (queue.textChannel) {
+            queue.textChannel.send(`❌ 無法播放歌曲 **${song.title}**，已自動跳過。原因：${error.message}`);
+        }
+        queue.songs.shift();
+        playNext(guildId);
     }
 }
+
 
 // 處理訊息事件以進行 AI 對話 (透過 @提及 啟動討論串，並在討論串中持續對話)
 client.on('messageCreate', async message => {
@@ -484,9 +575,18 @@ client.on('messageCreate', async message => {
 
         // 如果是新對話且不在討論串中，我們主動建立一個討論串
         if (isNewConversation) {
-            // 建立討論串 (名稱最多 100 字，取 prompt 的前 20 字)
-            const threadName = `💬 AI對話 - ${prompt.substring(0, 20)}${prompt.length > 20 ? '...' : ''}`;
-            
+            // 清理提問內容中的 Discord 特殊標籤（如 @提及、#頻道、自訂表情），避免討論串名稱顯示原始 ID 標記
+            const cleanNamePrompt = prompt
+                .replace(/<@!?\d+>/g, '') // 移除用戶提及
+                .replace(/<@&\d+>/g, '')  // 移除身分組提及
+                .replace(/<#\d+>/g, '')   // 移除頻道連結
+                .replace(/<a?:\w+:\d+>/g, '') // 移除自訂表情符號
+                .replace(/\s+/g, ' ')     // 整理多餘空格
+                .trim();
+
+            const displayName = cleanNamePrompt || '聊天對話';
+            const threadName = `💬 AI對話 - ${displayName.substring(0, 20)}${displayName.length > 20 ? '...' : ''}`;
+
             // 在原訊息下建立一個討論串
             const thread = await message.startThread({
                 name: threadName,
@@ -543,4 +643,3 @@ client.on('threadDelete', thread => {
 
 // 登入 Discord
 client.login(process.env.DISCORD_TOKEN);
-gachaClient.login(process.env.DISCORD_TOKEN);

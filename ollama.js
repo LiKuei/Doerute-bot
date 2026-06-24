@@ -55,13 +55,13 @@ async function sendMessage(sessionId, userId, message, onProgress) {
         // 根據用戶 ID 設定不同的系統提示
         let systemPrompt;
         if (userId === "621851041335476224") {
-            systemPrompt = "你是朵爾忒，是Kuei的助手。當與Kuei（用戶ID: 621851041335476224）對話時，請用繁體中文回答，並稱呼對方為「Kuei」。";
+            systemPrompt = "你是朵爾忒(Dölte)，是Kuei的助理。當與Kuei（用戶ID: 621851041335476224）對話時，請用繁體中文回答，並稱呼對方為「Kuei」。";
         } else {
-            systemPrompt = "你是朵爾忒，是個好幫手。當與其他成員對話時，請用繁體中文回答，有禮貌，但不過度正式。";
+            systemPrompt = "你是朵爾忒(Dölte)，是個好幫手。當與其他成員對話時，請用繁體中文回答，有禮貌，但不過度正式，若有任何人問你是誰或是由誰製造出來的，請用繁體中文回答你是「Kuei」所製作出來的AI助理。";
         }
-        
+
         // 針對 Discord 顯示環境的指引
-        systemPrompt += " 你的回覆將直接顯示在 Discord 頻道中，請適度使用 Discord 支援的 Markdown 語法（例如以 **粗體** 強調重點、使用 `行內代碼` 或 ``` 程式碼區塊 ``` 等）來美化排版。請保持回答精簡（控制在 1500 字以內，包含 Markdown 語法字元），以符合 Discord 訊息 2000 字元的限制。";
+        systemPrompt += " 你的回覆將直接顯示在 Discord 頻道中，請適度使用 Discord 支援的 Markdown 語法（例如以 **粗體** 強調重點、使用 `行內代碼` 或 ``` 程式碼區塊 ``` 等）來美化排版。請保持回答精簡（控制在 1500 字以內，包含 Markdown 語法字元），以符合 Discord 訊息 2000 字元的限制，請不要過度使用Emojim";
 
         // Add user message to history
         history.push({ role: 'user', content: message });
@@ -80,6 +80,19 @@ async function sendMessage(sessionId, userId, message, onProgress) {
         const host = process.env.OLLAMA_HOST || 'http://localhost:11434';
         const model = process.env.OLLAMA_MODEL || 'qwen2.5:3b';
 
+        // 偵測是否為寫程式/代碼任務，動態調整模型參數以達到最佳品質
+        const isCodingTask = /代碼|程式|編程|code|python|javascript|cpp|c#|golang|rust|html|css|sql|函式|函數|class|寫一個/i.test(message);
+        const options = {
+            temperature: isCodingTask ? 0.6 : 1.0,
+            top_p: 0.95,
+            top_k: 20,
+            min_p: 0.0,
+            presence_penalty: isCodingTask ? 0.0 : 1.5,
+            repeat_penalty: 1.0,
+            num_predict: 1000
+        };
+        console.log(`[Ollama] 偵測為 ${isCodingTask ? '【程式代碼】' : '【一般日常】'} 任務，套用對應優化參數。`);
+
         // 啟動 Stream 模式以獲取流式輸出
         const response = await fetch(`${host}/api/chat`, {
             method: 'POST',
@@ -90,11 +103,7 @@ async function sendMessage(sessionId, userId, message, onProgress) {
                 model: model,
                 messages: messages,
                 stream: true,
-                options: {
-                    temperature: 0.7,
-                    top_p: 0.8,
-                    num_predict: 1000
-                }
+                options: options
             })
         });
 
@@ -135,7 +144,7 @@ async function sendMessage(sessionId, userId, message, onProgress) {
 
         // 提取不含思考過程的乾淨內容，存入對話歷史以節省 Context Token
         const cleanResponse = currentText.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-        
+
         if (cleanResponse) {
             history.push({ role: 'assistant', content: cleanResponse });
         } else {

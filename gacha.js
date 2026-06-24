@@ -1,12 +1,3 @@
-const { Client, GatewayIntentBits } = require('discord.js');
-const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-    ],
-});
-
 // 表情符號的機率設定
 const EMOTE_PROBABILITIES = {
     'Gayge': 0.05,  // 5%
@@ -93,5 +84,5 @@ async function gacha(guild) {
     }
 }
 
-// 導出 client 和 gacha 函數供主程序使用
-module.exports = { client, gacha }; 
+// 導出 gacha 函數供主程式使用
+module.exports = { gacha };
