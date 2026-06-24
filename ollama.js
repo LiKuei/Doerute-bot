@@ -5,6 +5,22 @@ const readline = require('readline');
 const chatHistory = new Map();
 
 /**
+ * Safe truncate to respect Discord's 2000 character limit without breaking markdown formatting
+ * @param {string} text - The formatted text to send
+ * @param {number} maxLength - Maximum allowable length (default 1990)
+ * @returns {string}
+ */
+function safeTruncate(text, maxLength = 1990) {
+    if (text.length <= maxLength) return text;
+    const truncated = text.slice(0, maxLength - 30); // Leave space for suffix
+    const occurrences = (truncated.match(/\|\|/g) || []).length;
+    if (occurrences % 2 !== 0) {
+        return truncated + '...||\n*(內容過長已截斷)*';
+    }
+    return truncated + '\n*(內容過長已截斷)*';
+}
+
+/**
  * Helper function to format thinking content dynamically for Discord
  * Wrap the `<think>` tag contents in Discord spoiler `||` tags, allowing real-time streaming formats
  */
@@ -15,12 +31,22 @@ function formatThinking(text) {
     if (hasStartThink) {
         if (hasCompleteThink) {
             return text.replace(/<think>([\s\S]*?)<\/think>/g, (match, p1) => {
-                return `||**[思考過程]**\n${p1.trim()}||\n`;
+                const trimmed = p1.trim();
+                const limit = 800;
+                const displayThink = trimmed.length > limit 
+                    ? trimmed.slice(0, limit) + '\n... (思考過程過長已截斷)' 
+                    : trimmed;
+                return `||**[思考過程]**\n${displayThink}||\n`;
             }).trim();
         } else {
             // 還在思考中，將目前已有的思考內容包裹在隱藏標籤，並提示正在思考
             const thinkContent = text.split('<think>')[1] || '';
-            return `||**[思考中...]**\n${thinkContent.trim()}||\n*(正在思考中...)*`;
+            const trimmed = thinkContent.trim();
+            const limit = 800;
+            const displayThink = trimmed.length > limit 
+                ? trimmed.slice(0, limit) + '\n... (思考過程過長已截斷)' 
+                : trimmed;
+            return `||**[思考中...]**\n${displayThink}||\n*(正在思考中...)*`;
         }
     }
     return text;
@@ -62,6 +88,11 @@ async function sendMessage(sessionId, userId, message, onProgress) {
 
         // 針對 Discord 顯示環境的指引
         systemPrompt += " 你的回覆將直接顯示在 Discord 頻道中，請適度使用 Discord 支援的 Markdown 語法（例如以 **粗體** 強調重點、使用 `行內代碼` 或 ``` 程式碼區塊 ``` 等）來美化排版。請保持回答精簡（控制在 1500 字以內，包含 Markdown 語法字元），以符合 Discord 訊息 2000 字元的限制，請不要過度使用Emojim";
+
+        const disableThinking = process.env.DISABLE_THINKING === 'true';
+        if (disableThinking) {
+            systemPrompt += " 請直接回答問題，不要輸出任何思考過程或思考文字。";
+        }
 
         // Add user message to history
         history.push({ role: 'user', content: message });
@@ -121,19 +152,37 @@ async function sendMessage(sessionId, userId, message, onProgress) {
 
         let currentText = '';
         let lastEditTime = Date.now();
+        let inThinking = false;
 
         for await (const line of rl) {
             if (!line.trim()) continue;
             try {
                 const parsed = JSON.parse(line);
                 const chunk = parsed.message?.content || '';
-                currentText += chunk;
+                const thinkingChunk = parsed.message?.thinking || '';
+
+                if (thinkingChunk && !disableThinking) {
+                    if (!inThinking) {
+                        inThinking = true;
+                        currentText += '<think>\n';
+                    }
+                    currentText += thinkingChunk;
+                }
+
+                if (chunk) {
+                    if (inThinking) {
+                        inThinking = false;
+                        currentText += '\n</think>\n';
+                    }
+                    currentText += chunk;
+                }
 
                 // 每隔 1.5 秒更新一次 Discord 訊息，避免觸發 Discord rate limit
                 if (onProgress && Date.now() - lastEditTime > 1500) {
                     const formattedText = formatThinking(currentText);
-                    if (formattedText.trim()) {
-                        onProgress(formattedText);
+                    const safeText = safeTruncate(formattedText);
+                    if (safeText.trim()) {
+                        onProgress(safeText);
                     }
                     lastEditTime = Date.now();
                 }
@@ -142,21 +191,28 @@ async function sendMessage(sessionId, userId, message, onProgress) {
             }
         }
 
+        if (inThinking) {
+            inThinking = false;
+            currentText += '\n</think>\n';
+        }
+
         // 提取不含思考過程的乾淨內容，存入對話歷史以節省 Context Token
         const cleanResponse = currentText.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 
         if (cleanResponse) {
             history.push({ role: 'assistant', content: cleanResponse });
         } else {
-            history.push({ role: 'assistant', content: '（本地模型未回覆任何內容）' });
+            // 若無有效回覆，則移除此輪對話，保持對話歷史的對等性
+            history.pop();
         }
 
         const finalFormatted = formatThinking(currentText);
-        if (!finalFormatted.trim()) {
+        const safeFinal = safeTruncate(finalFormatted);
+        if (!safeFinal.trim()) {
             return '（本地模型未回覆任何內容，請重試或確認模型狀態）';
         }
 
-        return finalFormatted;
+        return safeFinal;
     } catch (error) {
         console.error('Error in Ollama chat:', error);
 

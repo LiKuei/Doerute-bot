@@ -2,7 +2,7 @@ process.env.YTDL_NO_UPDATE = 'true';
 require('dotenv').config(); // 載入 .env 環境變數
 
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, entersState, VoiceConnectionStatus } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, entersState, VoiceConnectionStatus, demuxProbe } = require('@discordjs/voice');
 const { spawn } = require('child_process');
 const path = require('path');
 const { gacha } = require('./gacha.js');
@@ -46,15 +46,35 @@ async function getYoutubeVideoInfo(url) {
     };
 }
 
-async function getYoutubeStreamUrl(url) {
-    return runYtDlp([
+function createYoutubeAudioProcess(url) {
+    const proc = spawn(getYtDlpPath(), [
         url,
-        '--get-url',
         '--format',
-        'bestaudio[ext=webm]/bestaudio',
+        'bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio',
+        '--output',
+        '-',
         '--no-playlist',
-        '--no-warnings'
-    ]);
+        '--no-warnings',
+        '--quiet'
+    ], {
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    proc.stderrText = '';
+    proc.stderr.on('data', chunk => {
+        proc.stderrText = (proc.stderrText + chunk.toString()).slice(-1000);
+    });
+
+    return proc;
+}
+
+function stopCurrentStream(queue) {
+    const proc = queue.currentYtDlp;
+    queue.currentYtDlp = null;
+
+    if (proc && proc.exitCode === null && !proc.killed) {
+        proc.kill('SIGKILL');
+    }
 }
 
 function validateYoutubeURL(url) {
@@ -174,7 +194,9 @@ client.on('interactionCreate', async interaction => {
             queue.songs.push({
                 url: url,
                 title: videoTitle,
-                duration: duration
+                duration: duration,
+                durationSeconds: info.durationSeconds,
+                retryCount: 0
             });
 
             // 創建嵌入訊息
@@ -300,8 +322,10 @@ client.on('interactionCreate', async interaction => {
 
         try {
             // 停止播放器
+            queue.destroying = true;
             queue.player.stop();
             // 斷開連接
+            stopCurrentStream(queue);
             queue.connection.destroy();
             // 清除閒置計時器
             if (queue.idleTimeout) {
@@ -349,6 +373,8 @@ client.on('interactionCreate', async interaction => {
             flags: [1 << 6]
         });
     } else if (interaction.customId === 'skip') {
+        stopCurrentStream(queue);
+        queue.skipRequested = true;
         queue.player.stop();
         await interaction.reply({
             content: '⏭️ 已跳過當前歌曲',
@@ -399,7 +425,11 @@ function getOrCreateQueue(interaction) {
             connection: null,
             player: createAudioPlayer(),
             textChannel: interaction.channel,
-            idleTimeout: null
+            idleTimeout: null,
+            currentYtDlp: null,
+            playbackStartedAt: 0,
+            skipRequested: false,
+            destroying: false
         };
         queues.set(interaction.guildId, queue);
         setupPlayerListeners(queue, interaction.guildId);
@@ -421,6 +451,29 @@ function setupPlayerListeners(queue, guildId) {
     });
 
     queue.player.on(AudioPlayerStatus.Idle, () => {
+        if (queue.destroying) return;
+
+        const song = queue.songs[0];
+        const wasSkipRequested = queue.skipRequested;
+        queue.skipRequested = false;
+
+        stopCurrentStream(queue);
+
+        if (song && !wasSkipRequested && song.durationSeconds > 0) {
+            const playedSeconds = (Date.now() - queue.playbackStartedAt) / 1000;
+            const endedTooEarly = playedSeconds < song.durationSeconds - 15;
+
+            if (endedTooEarly && song.retryCount < 2) {
+                song.retryCount += 1;
+                console.warn(`[Music] Guild ${guildId} stream ended early after ${Math.round(playedSeconds)}s, retrying ${song.retryCount}/2`);
+                if (queue.textChannel) {
+                    queue.textChannel.send(`⚠️ 串流提早中斷，正在重新嘗試播放：${song.title}`);
+                }
+                playNext(guildId);
+                return;
+            }
+        }
+
         // 移除已播放完畢的歌
         queue.songs.shift();
 
@@ -443,6 +496,7 @@ function setupPlayerListeners(queue, guildId) {
     });
 
     queue.player.on('error', error => {
+        stopCurrentStream(queue);
         console.error(`[Music] Guild ${guildId} 播放錯誤：`, error.message);
 
         if (queue.textChannel) {
@@ -492,14 +546,31 @@ async function playNext(guildId) {
             }
         }
 
-        const streamUrl = await getYoutubeStreamUrl(song.url);
+        stopCurrentStream(queue);
 
-        const resource = createAudioResource(streamUrl, {
+        const audioProcess = createYoutubeAudioProcess(song.url);
+        queue.currentYtDlp = audioProcess;
+
+        const probe = await Promise.race([
+            demuxProbe(audioProcess.stdout),
+            new Promise((_, reject) => {
+                audioProcess.once('error', reject);
+                audioProcess.once('close', code => {
+                    if (code !== 0 && code !== null) {
+                        reject(new Error(`yt-dlp 播放串流失敗 (${code})：${audioProcess.stderrText.trim()}`));
+                    }
+                });
+            })
+        ]);
+        const resource = createAudioResource(probe.stream, {
+            inputType: probe.type,
             inlineVolume: true,
             silencePaddingFrames: 0
         });
 
         resource.volume.setVolume(0.5);
+        queue.playbackStartedAt = Date.now();
+        queue.skipRequested = false;
         queue.player.play(resource);
 
         if (queue.textChannel) {
@@ -508,6 +579,7 @@ async function playNext(guildId) {
 
     } catch (error) {
         console.error(`[Music] Guild ${guildId} 播放準備出錯:`, error.message);
+        stopCurrentStream(queue);
         if (queue.textChannel) {
             queue.textChannel.send(`❌ 無法播放歌曲 **${song.title}**，已自動跳過。原因：${error.message}`);
         }
@@ -524,6 +596,15 @@ client.on('messageCreate', async message => {
 
     // 檢查目前訊息是否在討論串 (Thread) 中
     const isThread = message.channel.isThread();
+
+    // 檢查 Ollama 功能是否啟用
+    if (process.env.ENABLE_OLLAMA === 'false') {
+        // 僅在一般頻道被 @ 提及時回覆提示，避免在討論串中洗板
+        if (!isThread && message.mentions.has(client.user.id) && !message.mentions.everyone) {
+            message.reply('❌ 目前本地 AI 對話功能已暫時關閉。').catch(console.error);
+        }
+        return;
+    }
 
     let shouldRespond = false;
     let isNewConversation = false;
