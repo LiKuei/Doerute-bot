@@ -4,10 +4,10 @@ const { REST, Routes, SlashCommandBuilder } = require('discord.js');
 const commands = [
     new SlashCommandBuilder()
         .setName('play')
-        .setDescription('🎵 播放 YouTube 音樂')
+        .setDescription('🎵 播放 YouTube 音樂或匯入播放清單')
         .addStringOption(option =>
             option.setName('url')
-                .setDescription('YouTube 影片連結')
+                .setDescription('YouTube 影片或播放清單連結')
                 .setRequired(true)),
     new SlashCommandBuilder()
         .setName('controls')

@@ -46,6 +46,239 @@ async function getYoutubeVideoInfo(url) {
     };
 }
 
+function isYoutubePlaylistURL(url) {
+    try {
+        const parsed = new URL(url.includes('://') ? url : `https://${url}`);
+        return parsed.searchParams.has('list') || parsed.pathname === '/playlist';
+    } catch {
+        return false;
+    }
+}
+
+function truncateText(text, maxLength) {
+    if (text.length <= maxLength) return text;
+    return `${text.slice(0, maxLength - 3)}...`;
+}
+
+function buildQueueDescription(songs) {
+    if (songs.length === 0) return '目前播放序列是空的。';
+
+    const maxLines = 20;
+    const maxLength = 3800;
+    const lines = [];
+
+    for (let i = 0; i < songs.length && lines.length < maxLines; i += 1) {
+        const song = songs[i];
+        const line = `${i + 1}. ${song.title} (${song.duration})`;
+        const nextDescription = [...lines, line].join('\n');
+
+        if (nextDescription.length > maxLength) break;
+        lines.push(line);
+    }
+
+    if (lines.length < songs.length) {
+        lines.push(`...以及 ${songs.length - lines.length} 首`);
+    }
+
+    return lines.join('\n');
+}
+
+function parseYoutubeURL(url) {
+    return new URL(url.includes('://') ? url : `https://${url}`);
+}
+
+function getYoutubePlaylistId(url) {
+    try {
+        const parsed = parseYoutubeURL(url);
+        return parsed.searchParams.get('list');
+    } catch {
+        return null;
+    }
+}
+
+function parseCount(value) {
+    if (typeof value === 'number') return value;
+    if (typeof value !== 'string') return 0;
+
+    const normalized = value.replace(/,/g, '');
+    const match = normalized.match(/\d+/);
+    return match ? Number(match[0]) : 0;
+}
+
+function parseDurationText(durationText) {
+    if (typeof durationText !== 'string') return 0;
+    const trimmed = durationText.trim();
+    if (!/^\d{1,2}(?::\d{2}){1,2}$/.test(trimmed)) return 0;
+
+    return trimmed
+        .split(':')
+        .map(Number)
+        .reduce((total, part) => total * 60 + part, 0);
+}
+
+function toYoutubeWatchURL(entry) {
+    if (entry.webpage_url) return entry.webpage_url;
+    if (entry.url && /^https?:\/\//.test(entry.url)) return entry.url;
+    if (entry.id) return `https://www.youtube.com/watch?v=${entry.id}`;
+    if (entry.url) return `https://www.youtube.com/watch?v=${entry.url}`;
+    return null;
+}
+
+async function getYoutubePlaylistInfo(url) {
+    const output = await runYtDlp([
+        url,
+        '--dump-single-json',
+        '--flat-playlist',
+        '--yes-playlist',
+        '--ignore-errors',
+        '--no-warnings'
+    ]);
+    const meta = JSON.parse(output);
+    const entries = Array.isArray(meta.entries) ? meta.entries : [];
+    const songs = entries
+        .map(entry => {
+            const songUrl = toYoutubeWatchURL(entry);
+            if (!songUrl) return null;
+
+            const durationSeconds = entry.duration || 0;
+            return {
+                url: songUrl,
+                title: entry.title || '未知標題',
+                duration: durationSeconds > 0 ? formatDuration(durationSeconds) : '未知',
+                durationSeconds,
+                retryCount: 0
+            };
+        })
+        .filter(Boolean);
+
+    const expectedCount = meta.playlist_count || meta.n_entries || entries.length;
+    if (expectedCount > songs.length) {
+        const fallback = await getYoutubePlaylistInfoFromYoutubei(url, expectedCount).catch(error => {
+            console.warn(`[Music] youtubei playlist fallback failed: ${error.message}`);
+            return null;
+        });
+
+        if (fallback && fallback.songs.length > songs.length) {
+            return fallback;
+        }
+    }
+
+    return {
+        title: meta.title || 'YouTube 播放清單',
+        expectedCount,
+        songs,
+        partial: expectedCount > songs.length,
+        source: 'yt-dlp'
+    };
+}
+
+function getLockupDurationText(item) {
+    const overlayBadges = item.content_image?.overlays
+        ?.flatMap(overlay => overlay.badges || [])
+        ?.map(badge => badge.text)
+        ?.find(text => parseDurationText(text) > 0);
+
+    if (overlayBadges) return overlayBadges;
+
+    return item.metadata?.metadata?.metadata_rows
+        ?.flatMap(row => row.metadata_parts || [])
+        ?.map(part => part.text?.toString())
+        ?.find(text => parseDurationText(text) > 0);
+}
+
+function youtubeiItemToSong(item) {
+    if (item.type === 'LockupView') {
+        if (item.content_type !== 'VIDEO' || !item.content_id) return null;
+
+        const durationText = getLockupDurationText(item);
+        const durationSeconds = parseDurationText(durationText);
+
+        return {
+            url: `https://www.youtube.com/watch?v=${item.content_id}`,
+            title: item.metadata?.title?.toString() || '未知標題',
+            duration: durationSeconds > 0 ? formatDuration(durationSeconds) : (durationText || '未知'),
+            durationSeconds,
+            retryCount: 0
+        };
+    }
+
+    if (!item.id) return null;
+
+    const durationSeconds = item.duration?.seconds || 0;
+    return {
+        url: `https://www.youtube.com/watch?v=${item.id}`,
+        title: item.title?.toString() || '未知標題',
+        duration: durationSeconds > 0 ? formatDuration(durationSeconds) : (item.duration?.text || '未知'),
+        durationSeconds,
+        retryCount: 0
+    };
+}
+
+async function getYoutubeiContinuation(playlist) {
+    try {
+        if (playlist.has_continuation) {
+            return await playlist.getContinuation();
+        }
+    } catch (error) {
+        console.warn(`[Music] youtubei standard continuation failed: ${error.message}`);
+    }
+
+    const continuation = playlist.memo?.get('ContinuationItemView')?.[0];
+    if (!continuation?.endpoint) return null;
+
+    const page = await continuation.endpoint.call(playlist.actions, { parse: true });
+    return new playlist.constructor(playlist.actions, page, true);
+}
+
+async function getYoutubePlaylistInfoFromYoutubei(url, expectedCount = 0) {
+    const playlistId = getYoutubePlaylistId(url);
+    if (!playlistId) {
+        throw new Error('找不到 YouTube 播放清單 ID');
+    }
+
+    const { Innertube } = await import('youtubei.js');
+    const originalWarn = console.warn;
+
+    try {
+        console.warn = (...args) => {
+            if (typeof args[0] === 'string' && args[0].startsWith('[YOUTUBEJS]')) return;
+            originalWarn(...args);
+        };
+
+        const youtube = await Innertube.create();
+        let playlist = await youtube.getPlaylist(playlistId);
+        const playlistTitle = playlist.info?.title || 'YouTube 播放清單';
+        const totalItemsHint = parseCount(playlist.info?.total_items);
+        const seen = new Set();
+        const songs = [];
+        const maxItems = Math.max(expectedCount, 2000);
+
+        while (playlist) {
+            for (const item of playlist.videos) {
+                const song = youtubeiItemToSong(item);
+                if (!song || seen.has(song.url)) continue;
+                seen.add(song.url);
+                songs.push(song);
+            }
+
+            if (songs.length >= maxItems) break;
+            playlist = await getYoutubeiContinuation(playlist);
+        }
+
+        const totalItems = totalItemsHint || expectedCount || songs.length;
+
+        return {
+            title: playlistTitle,
+            expectedCount: totalItems,
+            songs,
+            partial: totalItems > songs.length,
+            source: 'youtubei.js'
+        };
+    } finally {
+        console.warn = originalWarn;
+    }
+}
+
 function createYoutubeAudioProcess(url) {
     const proc = spawn(getYtDlpPath(), [
         url,
@@ -162,11 +395,6 @@ client.on('interactionCreate', async interaction => {
         await interaction.deferReply();
 
         try {
-            // 獲取影片資訊
-            const info = await getYoutubeVideoInfo(url);
-            const videoTitle = info.title;
-            const duration = formatDuration(info.durationSeconds);
-
             // 取得或建立伺服器的佇列
             const queue = getOrCreateQueue(interaction);
 
@@ -190,24 +418,66 @@ client.on('interactionCreate', async interaction => {
                 queue.connection.subscribe(queue.player);
             }
 
-            // 將歌曲加入佇列
-            queue.songs.push({
-                url: url,
-                title: videoTitle,
-                duration: duration,
-                durationSeconds: info.durationSeconds,
-                retryCount: 0
-            });
+            const shouldStartPlayback = queue.songs.length === 0;
+            const startPosition = queue.songs.length + 1;
+            let embed;
 
-            // 創建嵌入訊息
-            const embed = new EmbedBuilder()
-                .setColor('#0099ff')
-                .setTitle('🎵 已將歌曲加入播放清單！')
-                .addFields(
-                    { name: '歌曲', value: videoTitle },
-                    { name: '時長', value: duration },
-                    { name: '序列位置', value: `#${queue.songs.length}` }
-                );
+            if (isYoutubePlaylistURL(url)) {
+                const playlist = await getYoutubePlaylistInfo(url);
+                if (playlist.songs.length === 0) {
+                    throw new Error('播放清單內沒有可加入的影片');
+                }
+
+                queue.songs.push(...playlist.songs);
+
+                const preview = playlist.songs
+                    .slice(0, 5)
+                    .map((song, index) => `${index + 1}. ${song.title} (${song.duration})`)
+                    .join('\n');
+                const moreText = playlist.songs.length > 5 ? `\n...以及 ${playlist.songs.length - 5} 首` : '';
+                const countText = playlist.expectedCount && playlist.expectedCount !== playlist.songs.length
+                    ? `${playlist.songs.length}/${playlist.expectedCount} 首`
+                    : `${playlist.songs.length} 首`;
+                const titleText = playlist.partial
+                    ? '⚠️ 已部分匯入 YouTube 播放清單'
+                    : '🎵 已匯入 YouTube 播放清單！';
+
+                embed = new EmbedBuilder()
+                    .setColor(playlist.partial ? '#ffaa00' : '#0099ff')
+                    .setTitle(titleText)
+                    .addFields(
+                        { name: '播放清單', value: truncateText(playlist.title, 1024) },
+                        { name: '加入數量', value: countText },
+                        { name: '起始位置', value: `#${startPosition}` },
+                        { name: '歌曲預覽', value: truncateText(preview + moreText, 1024) }
+                    )
+                    .setFooter({ text: `來源：${playlist.source || 'yt-dlp'}` });
+            } else {
+                // 獲取影片資訊
+                const info = await getYoutubeVideoInfo(url);
+                const videoTitle = info.title;
+                const duration = formatDuration(info.durationSeconds);
+
+                // 將歌曲加入佇列
+                queue.songs.push({
+                    url: url,
+                    title: videoTitle,
+                    duration: duration,
+                    durationSeconds: info.durationSeconds,
+                    retryCount: 0
+                });
+
+                // 創建嵌入訊息
+                embed = new EmbedBuilder()
+                    .setColor('#0099ff')
+                    .setTitle('🎵 已將歌曲加入播放清單！')
+                    .addFields(
+                        { name: '歌曲', value: videoTitle },
+                        { name: '時長', value: duration },
+                        { name: '序列位置', value: `#${queue.songs.length}` }
+                    );
+            }
+
 
             // 創建按鈕
             const row = new ActionRowBuilder()
@@ -225,7 +495,7 @@ client.on('interactionCreate', async interaction => {
             });
 
             // 如果佇列中只有一首歌，開始播放
-            if (queue.songs.length === 1) {
+            if (shouldStartPlayback) {
                 playNext(interaction.guildId);
             }
 
@@ -352,6 +622,7 @@ client.on('interactionCreate', async interaction => {
 client.on('interactionCreate', async interaction => {
     if (!interaction.isButton()) return;
 
+    try {
     const queue = queues.get(interaction.guildId);
     if (!queue || !queue.player) {
         return interaction.reply({
@@ -364,9 +635,8 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
             .setColor('#0099ff')
             .setTitle('🎵 播放序列')
-            .setDescription(queue.songs.map((song, index) =>
-                `${index + 1}. ${song.title} (${song.duration})`
-            ).join('\n'));
+            .setDescription(buildQueueDescription(queue.songs))
+            .setFooter({ text: `共 ${queue.songs.length} 首` });
 
         await interaction.reply({
             embeds: [embed],
@@ -405,6 +675,19 @@ client.on('interactionCreate', async interaction => {
                 content: '❌ 音樂正在播放中',
                 flags: [1 << 6]
             });
+        }
+    }
+    } catch (error) {
+        console.error('處理音樂控制按鈕時發生錯誤：', error);
+        const payload = {
+            content: '❌ 處理音樂控制時發生錯誤，請稍後再試。',
+            flags: [1 << 6]
+        };
+
+        if (interaction.deferred || interaction.replied) {
+            await interaction.followUp(payload).catch(console.error);
+        } else {
+            await interaction.reply(payload).catch(console.error);
         }
     }
 });
